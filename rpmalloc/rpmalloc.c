@@ -1563,11 +1563,6 @@ _rpmalloc_heap_cache_insert(heap_t* heap, span_t* span) {
 static span_t*
 _rpmalloc_heap_thread_cache_extract(heap_t* heap, size_t span_count) {
 	span_t* span = 0;
-	if (span_count == 1) {
-		_rpmalloc_heap_cache_adopt_deferred(heap, &span);
-		if (span)
-			return span;
-	}
 #if ENABLE_THREAD_CACHE
 	span_cache_t* span_cache;
 	if (span_count == 1)
@@ -1579,6 +1574,18 @@ _rpmalloc_heap_thread_cache_extract(heap_t* heap, size_t span_count) {
 		return span_cache->span[--span_cache->count];
 	}
 #endif
+	return span;
+}
+
+static span_t*
+_rpmalloc_heap_thread_cache_deferred_extract(heap_t* heap, size_t span_count) {
+	span_t* span = 0;
+	if (span_count == 1) {
+		_rpmalloc_heap_cache_adopt_deferred(heap, &span);
+	} else {
+		_rpmalloc_heap_cache_adopt_deferred(heap, 0);
+		span = _rpmalloc_heap_thread_cache_extract(heap, span_count);
+	}
 	return span;
 }
 
@@ -1650,6 +1657,11 @@ _rpmalloc_heap_extract_new_span(heap_t* heap, size_t span_count, uint32_t class_
 	(void)sizeof(class_idx);
 #endif
 	span = _rpmalloc_heap_thread_cache_extract(heap, span_count);
+	if (EXPECTED(span != 0)) {
+		_rpmalloc_stat_inc(&heap->size_class_use[class_idx].spans_from_cache);
+		return span;
+	}
+	span = _rpmalloc_heap_thread_cache_deferred_extract(heap, span_count);
 	if (EXPECTED(span != 0)) {
 		_rpmalloc_stat_inc(&heap->size_class_use[class_idx].spans_from_cache);
 		return span;
@@ -2028,6 +2040,7 @@ _rpmalloc_allocate_large(heap_t* heap, size_t size) {
 static void*
 _rpmalloc_allocate_huge(heap_t* heap, size_t size) {
 	assert(heap);
+	_rpmalloc_heap_cache_adopt_deferred(heap, 0);
 	size += SPAN_HEADER_SIZE;
 	size_t num_pages = size >> _memory_page_size_shift;
 	if (size & (_memory_page_size - 1))
@@ -2287,9 +2300,8 @@ _rpmalloc_deallocate_large(span_t* span) {
 	size_t idx = span->span_count - 1;
 	atomic_decr32(&span->heap->span_use[idx].current);
 #endif
-	heap_t* heap = get_thread_heap();
+	heap_t* heap = span->heap;
 	assert(heap);
-	span->heap = heap;
 	if ((span->span_count > 1) && !heap->finalize && !heap->spans_reserved) {
 		heap->span_reserve = span;
 		heap->spans_reserved = span->span_count;
